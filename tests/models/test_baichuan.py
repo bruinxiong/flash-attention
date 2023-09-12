@@ -148,9 +148,6 @@ def test_baichuan_parallel_forward(model_name, world_size):
     rank = parallel_state.get_tensor_model_parallel_rank()
     process_group = parallel_state.get_tensor_model_parallel_group()
 
-    # Need this, otherwise the Triton kernel seems to launched from the wrong device.
-    torch.cuda.set_device(device)
-
     pretrained_state_dict = remap_state_dict_hf_baichuan(
         state_dict_from_pretrained(model_name), config
     )
@@ -220,8 +217,9 @@ def test_baichuan_parallel_forward(model_name, world_size):
         ).abs().max().item()
 
 
+@pytest.mark.parametrize("fused_ft_kernel", [False, True])
 @pytest.mark.parametrize("model_name", ["baichuan-inc/Baichuan-7B"])
-def test_baichuan_generation(model_name):
+def test_baichuan_generation(model_name, fused_ft_kernel):
     dtype = torch.float16
     device = "cuda"
     config = baichuan_config_to_gpt2_config(
@@ -279,6 +277,7 @@ def test_baichuan_generation(model_name):
     model.load_state_dict(pretrained_state_dict)
     model.eval()
 
+    model(input_ids)  # Warm up
     print("Without CUDA graph")
     torch.cuda.synchronize()
     start = time.time()
@@ -286,7 +285,7 @@ def test_baichuan_generation(model_name):
         input_ids=input_ids,
         max_length=max_length,
         eos_token_id=eos_token_id,
-        fused_ft_kernel=True,
+        fused_ft_kernel=fused_ft_kernel,
         return_dict_in_generate=True,
         output_scores=True,
         enable_timing=True,
@@ -298,7 +297,7 @@ def test_baichuan_generation(model_name):
     # Capture graph outside the timing loop
     batch_size, seqlen_og = input_ids.shape
     model._decoding_cache = update_graph_cache(
-        model, None, batch_size, seqlen_og, max_length
+        model, None, batch_size, seqlen_og, max_length, fused_ft_kernel=fused_ft_kernel
     )
     print("With CUDA graph")
     torch.cuda.synchronize()
@@ -306,7 +305,7 @@ def test_baichuan_generation(model_name):
     out_cg = model.generate(
         input_ids=input_ids,
         max_length=max_length,
-        fused_ft_kernel=True,
+        fused_ft_kernel=fused_ft_kernel,
         cg=True,
         return_dict_in_generate=True,
         output_scores=True,
@@ -349,7 +348,7 @@ def test_baichuan_parallel_generation(model_name, world_size):
     config = baichuan_config_to_gpt2_config(
         AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     )
-    config.use_flash_attn = False
+    config.use_flash_attn = True
     config.fused_bias_fc = True
     config.fused_mlp = False  # We don't have fused GatedMLP yet
     config.fused_dropout_add_ln = False
@@ -396,7 +395,6 @@ def test_baichuan_parallel_generation(model_name, world_size):
         max_length=max_length,
         tensor_parallel=world_size,
         vocab_size=config.vocab_size,
-        fused_ft_kernel=True,
         # teacher_outputs=out_hf.sequences,
         return_dict_in_generate=True,
         output_scores=True,
@@ -406,7 +404,7 @@ def test_baichuan_parallel_generation(model_name, world_size):
     # Capture graph outside the timing loop
     batch_size, seqlen_og = input_ids.shape
     model._decoding_cache = update_graph_cache(
-        model, None, batch_size, seqlen_og, max_length
+        model, None, batch_size, seqlen_og, max_length, fused_ft_kernel=False
     )
     print("With CUDA graph")
     out_cg = model.generate(
@@ -414,7 +412,6 @@ def test_baichuan_parallel_generation(model_name, world_size):
         max_length=max_length,
         tensor_parallel=world_size,
         vocab_size=config.vocab_size,
-        fused_ft_kernel=True,
         cg=True,
         # teacher_outputs=out_hf.sequences,
         return_dict_in_generate=True,
@@ -461,6 +458,6 @@ def test_baichuan_parallel_generation(model_name, world_size):
         hf_error = (logits_hf - logits_ref).abs().max().item()
         print(f"HF fp16 logits max diff: {hf_error}")
         print(f"Logits max diff: {(logits - logits_ref).abs().max().item() }")
-        assert (logits - logits_ref).abs().max().item() < 2 * hf_error
         print(f"Logits CG max diff: {(logits_cg - logits_ref).abs().max().item() }")
+        assert (logits - logits_ref).abs().max().item() < 2 * hf_error
         assert torch.equal(logits_cg, logits)
